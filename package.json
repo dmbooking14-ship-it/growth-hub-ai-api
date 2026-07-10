@@ -1,0 +1,6 @@
+{
+  "name": "growth-hub-ai-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serverless AI Manager for VerselSuite Growth Hub. Generates outreach/follow-up emails and analyzes replies, with Gemini + OpenRouter provider fallback. Keeps all AI provider keys server-side."
+}
