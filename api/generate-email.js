@@ -21,6 +21,20 @@ import { generateWithAI, parseEmailResponse } from './aiManager.js';
 import { buildOutreachPrompt, buildFollowUpPrompt } from './promptManager.js';
 
 export default async function handler(request, response) {
+  // CORS: allow requests from any origin (needed since this API is
+  // called from the browser-based Growth Hub app, which runs on a
+  // different origin than this API — localhost during dev, Firebase
+  // Hosting's domain in production).
+  response.setHeader('Access-Control-Allow-Origin', '*');
+  response.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  // Browsers send an OPTIONS "preflight" request before the real POST,
+  // specifically to check these headers. Must respond 200 with no body.
+  if (request.method === 'OPTIONS') {
+    return response.status(200).end();
+  }
+
   if (request.method !== 'POST') {
     return response.status(405).json({ error: 'Use POST' });
   }
