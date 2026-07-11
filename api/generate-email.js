@@ -4,12 +4,20 @@
 // Endpoint: https://<project>.vercel.app/api/generate-email
 //
 // POST body:
-//   { "type": "outreach", "lead": {...}, "workspaceContext": {...} }
-//   OR
-//   { "type": "followup", "lead": {...}, "previousEmailBody": "...",
-//     "daysSinceSent": 3, "workspaceContext": {...} }
+//   {
+//     "templateKey": "validationCall",   // or "followUp", "betaInvitation" — see promptManager.js TEMPLATES
+//     "lead": {...},
+//     "workspaceContext": {...},          // optional: founderName, productDescription, etc.
+//     "extra": {                          // only needed for "followUp"
+//       "previousEmailBody": "...",
+//       "daysSinceSent": 3
+//     }
+//   }
 //
-// Response: { subject, body, provider, model }
+// If "templateKey" is omitted, defaults to "validationCall" (the
+// standard first-touch outreach email).
+//
+// Response: { subject, body, provider, model, templateKey }
 //
 // This endpoint ONLY generates content — spec Part 4 §2 principle:
 // "Never automatically send emails without explicit user
@@ -18,19 +26,13 @@
 // ============================================================
 
 import { generateWithAI, parseEmailResponse } from './aiManager.js';
-import { buildOutreachPrompt, buildFollowUpPrompt } from './promptManager.js';
+import { buildEmailPrompt, getAvailableTemplates } from './promptManager.js';
 
 export default async function handler(request, response) {
-  // CORS: allow requests from any origin (needed since this API is
-  // called from the browser-based Growth Hub app, which runs on a
-  // different origin than this API — localhost during dev, Firebase
-  // Hosting's domain in production).
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Browsers send an OPTIONS "preflight" request before the real POST,
-  // specifically to check these headers. Must respond 200 with no body.
   if (request.method === 'OPTIONS') {
     return response.status(200).end();
   }
@@ -39,21 +41,22 @@ export default async function handler(request, response) {
     return response.status(405).json({ error: 'Use POST' });
   }
 
-  const { type, lead, workspaceContext, previousEmailBody, daysSinceSent } = request.body || {};
+  const { templateKey = 'validationCall', lead, workspaceContext = {}, extra = {} } = request.body || {};
 
-  if (!type || !['outreach', 'followup'].includes(type)) {
-    return response.status(400).json({ error: '"type" must be "outreach" or "followup"' });
+  const available = getAvailableTemplates();
+  if (!available.includes(templateKey)) {
+    return response.status(400).json({
+      error: `Unknown templateKey "${templateKey}". Available: ${available.join(', ')}`
+    });
   }
   if (!lead || typeof lead !== 'object') {
     return response.status(400).json({ error: 'Missing "lead" object in request body' });
   }
-  if (type === 'followup' && !previousEmailBody) {
-    return response.status(400).json({ error: '"previousEmailBody" is required for type "followup"' });
+  if (templateKey === 'followUp' && !extra.previousEmailBody) {
+    return response.status(400).json({ error: '"extra.previousEmailBody" is required for templateKey "followUp"' });
   }
 
-  const prompt = type === 'outreach'
-    ? buildOutreachPrompt(lead, workspaceContext)
-    : buildFollowUpPrompt(lead, previousEmailBody, daysSinceSent || 3, workspaceContext);
+  const prompt = buildEmailPrompt(templateKey, lead, workspaceContext, extra);
 
   try {
     const result = await generateWithAI(prompt);
@@ -63,7 +66,8 @@ export default async function handler(request, response) {
       subject,
       body,
       provider: result.provider,
-      model: result.model
+      model: result.model,
+      templateKey
     });
   } catch (err) {
     console.error('generate-email handler error:', err);

@@ -1,100 +1,136 @@
 // ============================================================
 // api/promptManager.js
 //
-// Prompt Manager (spec Part 4 §6): prompts live here as named,
-// versioned templates — not hardcoded inline wherever AI gets
-// called. Adding a new AI feature later (reply summarizer, feature
-// extractor, etc.) means adding one function here, not touching
-// provider or routing code.
+// Prompt Manager (spec Part 4 §6): prompts live here as named
+// templates — not hardcoded inline wherever AI gets called.
 //
-// Each function takes structured data and returns a plain-text
-// prompt string ready to send to whichever provider answers.
+// TEMPLATES is the registry of available outreach email styles.
+// Adding a new one (e.g. "Beta Invitation") means adding one entry
+// here — nothing in aiManager.js, generate-email.js, or the
+// frontend needs to change to support it, since the endpoint
+// already accepts a `templateKey` and looks it up here.
+//
+// The default "validationCall" template encodes specific, tested
+// guidance (not just "write an outreach email") because vague
+// instructions produce generic-sounding output. Every rule below
+// exists because it fixes a specific failure mode observed in an
+// earlier draft — see inline comments.
 // ============================================================
 
-/**
- * Outreach Email Generator (spec Part 4 §8, first sub-section).
- * Builds the prompt for a first-touch personalized outreach email.
- *
- * @param {object} lead - lead fields (name, company, role, city, personalization, etc.)
- * @param {object} workspaceContext - workspace memory (spec Part 4 §5)
- * @returns {string} the assembled prompt
- */
-export function buildOutreachPrompt(lead, workspaceContext = {}) {
-  const {
-    founderName = 'the founder',
-    productDescription = 'a lead management platform for independent agents',
-    targetMarket = 'independent real estate agents',
-    tone = 'professional, conversational, founder-to-founder',
-    validationGoal = 'validate the product idea and learn what real agents need'
-  } = workspaceContext;
+const SHARED_RULES = `
+- Keep the email body under 140 words.
+- Use exactly ONE specific detail from the lead's personalization notes or role/city — do not stack multiple personalization points, and do not use generic flattery.
+- Do not explain that you're "not selling anything" or otherwise pre-defend the email — it reads as defensive and people already assume you might be selling something. Just be direct and genuine instead.
+- Never use buzzwords, hype, exclamation points, or phrases like "I'd love to pick your brain."
+- Write like one professional emailing another professional, not like a marketing email or a newsletter.
+- Do NOT include any sign-off, closing line, name, or signature at the end (no "Best,", no name, nothing after the last sentence of the message). The application appends the sender's real signature automatically after your response — if you include your own, it will appear twice.
+`.trim();
 
-  return `You are writing a short, personalized cold outreach email on behalf of ${founderName}, a solo founder building ${productDescription} for ${targetMarket}.
+const TEMPLATES = {
 
-Your goal for this email is to ${validationGoal} — this is a genuine validation conversation, not a sales pitch. The tone should be ${tone}.
+  // Default first-touch outreach. Objective: get a "yes" to a short
+  // call, not a written essay reply — the ask must be a single,
+  // low-friction decision (yes/no), never an open-ended question
+  // that requires the recipient to think and compose a real answer.
+  validationCall: (lead, ctx) => `
+You are writing a cold outreach email on behalf of ${ctx.founderName || 'a solo founder'}, who is building ${ctx.productDescription || 'a lead management platform for independent real estate agents'}.
 
-Here is what's known about the recipient:
+YOUR OBJECTIVE IS NOT TO SOUND PROFESSIONAL OR INSIGHTFUL. Your objective is to maximize the chance that a busy, independent real estate professional agrees to a short call. Everything below serves that one goal.
+
+Lead information:
 - Name: ${lead.name || 'Unknown'}
 - Company: ${lead.company || 'Unknown'}
 - Role: ${lead.role || 'Unknown'}
 - City: ${lead.city || 'Unknown'}
-- Website: ${lead.website || 'Unknown'}
 - Personalization notes: ${lead.personalization || 'None provided'}
-- General notes: ${lead.notes || 'None provided'}
 
-Write a short outreach email (under 130 words for the body). Requirements:
-- Reference something specific and genuine from the personalization notes or their role/city — avoid generic flattery.
-- Ask one clear, low-pressure question that invites a real reply (not a yes/no question).
-- Do not oversell the product. This is about learning, not closing a sale.
-- Do not use corporate buzzwords or exclamation points.
-- Sign off with just the founder's first name — no company boilerplate.
+Structure to follow:
+1. One sentence referencing the specific personalization detail (what makes this email clearly not a mass blast).
+2. One sentence stating you're building a lead management tool for independent agents and are learning directly from agents before building further.
+3. The ask: request a short call (10 minutes) sometime this week to hear how they currently manage leads and what's frustrating about it. This must be phrased as something answerable with yes or no — NOT as an open question requiring a written answer.
+4. One short closing line making clear there's no sales pitch.
+
+${SHARED_RULES}
 
 Respond in exactly this format, nothing else:
-SUBJECT: <subject line, under 8 words>
+SUBJECT: <subject line, under 6 words, should feel personal — like "Could I learn from your experience?" or "Quick question" — never like a newsletter or marketing subject>
 BODY:
-<email body>`;
-}
+<email body>`.trim(),
 
-/**
- * Follow-up Generator (spec Part 4 §8, second sub-section; Part 5 §15).
- * Builds a follow-up that references the prior email rather than
- * repeating it.
- *
- * @param {object} lead
- * @param {string} previousEmailBody - the body of the email being followed up on
- * @param {number} daysSinceSent
- * @param {object} workspaceContext
- * @returns {string}
- */
-export function buildFollowUpPrompt(lead, previousEmailBody, daysSinceSent, workspaceContext = {}) {
-  const { founderName = 'the founder', tone = 'professional, conversational, founder-to-founder' } = workspaceContext;
-
-  return `You are writing a brief, natural follow-up email on behalf of ${founderName}. It has been ${daysSinceSent} days since the original email below was sent, with no reply yet.
+  // Follow-up to an unanswered first email. Objective: reference the
+  // prior email naturally, lower the bar for replying even further
+  // than the first email did, without sounding like a guilt trip.
+  followUp: (lead, ctx, extra) => `
+You are writing a brief follow-up email on behalf of ${ctx.founderName || 'a solo founder'}. It has been ${extra.daysSinceSent || 3} days since the original email below was sent, with no reply.
 
 Original email that was sent:
 """
-${previousEmailBody}
+${extra.previousEmailBody}
 """
 
 Recipient: ${lead.name || 'Unknown'} at ${lead.company || 'Unknown'}
 
-Write a short follow-up (under 60 words). Requirements:
-- Reference the original email naturally — do not repeat its content.
-- Assume they're busy, not uninterested. Tone should be light, not pushy or apologetic.
-- End with a very easy way to respond (e.g. a single question they can answer in one line).
-- Tone: ${tone}.
+Write a short follow-up (under 50 words). Rules:
+- Reference the original email in one short clause — do not repeat its content or re-explain the ask.
+- Assume they're busy, not uninterested. Do not apologize for following up.
+- Repeat the same low-friction yes/no ask as the original (a short call), phrased even more simply than before.
+${SHARED_RULES}
 
 Respond in exactly this format, nothing else:
-SUBJECT: <subject line, under 8 words>
+SUBJECT: <subject line, under 6 words>
 BODY:
-<email body>`;
+<email body>`.trim(),
+
+  // Invite an already-validated, warm contact to try the beta.
+  // Objective: different from cold outreach — this lead has already
+  // engaged, so the ask can be slightly more direct.
+  betaInvitation: (lead, ctx) => `
+You are writing an email inviting ${lead.name || 'this contact'} to try an early beta of ${ctx.productDescription || 'a lead management platform for independent real estate agents'}, on behalf of ${ctx.founderName || 'a solo founder'}.
+
+This person has already had a prior conversation and expressed interest — this is NOT cold outreach. You can be warmer and more direct than a first-touch email.
+
+Lead notes: ${lead.notes || 'None provided'}
+Validation notes: ${lead.personalization || 'None provided'}
+
+Write a short email (under 120 words) that:
+- Thanks them briefly for the earlier conversation, referencing one specific thing they mentioned if available.
+- Invites them to be one of the first to try the product.
+- Makes clear there's no cost and their feedback directly shapes what gets built.
+- Ends with one clear next step (e.g. reply "yes" and you'll send access).
+
+${SHARED_RULES}
+
+Respond in exactly this format, nothing else:
+SUBJECT: <subject line, under 6 words>
+BODY:
+<email body>`.trim(),
+
+};
+
+/**
+ * Builds the prompt for a given template. `templateKey` selects
+ * which style to use (defaults to 'validationCall', the standard
+ * first-touch outreach). `extra` carries template-specific data
+ * (e.g. previousEmailBody + daysSinceSent for 'followUp').
+ */
+export function buildEmailPrompt(templateKey, lead, workspaceContext = {}, extra = {}) {
+  const template = TEMPLATES[templateKey] || TEMPLATES.validationCall;
+  return template(lead, workspaceContext, extra);
 }
 
 /**
- * Reply Summarizer (spec Part 4 §8; Part 2 §10 Reply Collection fields).
- * Extracts structured signal from a raw reply.
- *
- * @param {string} replyBody - raw text of the reply
- * @returns {string}
+ * Returns the list of available template keys, so the frontend can
+ * offer a picker (spec's "Validation Call, Beta Invitation,
+ * Follow-up, Customer Interview, Feature Feedback" idea) without
+ * hardcoding the list in two places.
+ */
+export function getAvailableTemplates() {
+  return Object.keys(TEMPLATES);
+}
+
+/**
+ * Reply Summarizer (unchanged from before — analysis, not outreach
+ * generation, so it isn't part of the TEMPLATES registry above).
  */
 export function buildReplySummaryPrompt(replyBody) {
   return `Analyze this email reply and extract structured information. Reply text:
