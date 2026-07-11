@@ -20,7 +20,7 @@ const KEYS = [
   process.env.OPENROUTER_API_KEY_5
 ].filter(Boolean);
 
-const MODEL = 'google/gemini-2.0-flash-001'; // reasonable default; swap freely, this is just a starting choice
+const MODEL = 'meta-llama/llama-3.3-70b-instruct:free'; // free tier, no cost, good general instruction-following for email writing
 const BASE_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 /**

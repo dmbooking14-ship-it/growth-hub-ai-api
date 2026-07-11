@@ -20,7 +20,10 @@ const KEYS = [
   process.env.GEMINI_API_KEY_2
 ].filter(Boolean); // skips any key that isn't set, so partial setup doesn't crash
 
-const MODEL = 'gemini-2.0-flash'; // fast + cheap, good default for outreach-email generation
+const MODEL = 'gemini-flash-latest'; // stable alias Google maintains to always point at their current
+                                       // recommended Flash model (gemini-2.0-flash was shut down June 1,
+                                       // 2026 — using a versioned name risks this breaking again the same
+                                       // way when Google deprecates the next one)
 const BASE_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
 /**
@@ -43,9 +46,12 @@ export async function callGemini(prompt) {
   for (let i = 0; i < KEYS.length; i++) {
     const key = KEYS[i];
     try {
-      const response = await fetch(`${BASE_URL}?key=${key}`, {
+      const response = await fetch(BASE_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': key
+        },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: { temperature: 0.7, maxOutputTokens: 1500 }
