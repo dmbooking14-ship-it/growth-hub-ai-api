@@ -2,5 +2,8 @@
   "name": "growth-hub-ai-api",
   "version": "1.0.0",
   "private": true,
-  "description": "Serverless AI Manager for VerselSuite Growth Hub. Generates outreach/follow-up emails and analyzes replies, with Gemini + OpenRouter provider fallback. Keeps all AI provider keys server-side."
+  "description": "Serverless AI Manager + Gmail integration for VerselSuite Growth Hub. Generates outreach/follow-up emails, analyzes replies, and sends/connects Gmail. Keeps all provider keys and tokens server-side.",
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  }
 }
