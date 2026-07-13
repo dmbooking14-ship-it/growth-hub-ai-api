@@ -134,6 +134,12 @@ export default async function handler(request, response) {
         messageId: sendData.id,
         threadId: sendData.threadId,
         emailCount: currentEmailCount + 1,
+        // Stored so a later follow-up can reference the actual sent
+        // content (promptManager.js's followUp template requires
+        // this as input) — without it, follow-ups would have nothing
+        // real to "follow up on."
+        lastEmailSubject: subject,
+        lastEmailBody: body,
         updatedAt: new Date().toISOString()
       });
     }
