@@ -114,17 +114,28 @@ export default async function handler(request, response) {
       return response.status(502).json({ error: 'Gmail rejected the send request.', detail: sendData });
     }
 
-    // Step 5: update the lead record, if a leadId was provided
+    // Step 5: update the lead record, if a leadId was provided.
+    // Marks status as Contacted and schedules the same 3-day
+    // follow-up the manual "Contacted" button applies (leadDetail.js)
+    // — sending an email is equivalent to manually marking Contacted,
+    // so both paths should produce the same resulting lead state.
     if (leadId) {
-      await db.collection('workspaces').doc(workspaceId)
-        .collection('leads').doc(leadId)
-        .update({
-          lastContacted: new Date().toISOString(),
-          messageId: sendData.id,
-          threadId: sendData.threadId,
-          emailCount: (workspace.emailCount || 0) + 1,
-          updatedAt: new Date().toISOString()
-        });
+      const leadRef = db.collection('workspaces').doc(workspaceId).collection('leads').doc(leadId);
+      const leadSnap = await leadRef.get();
+      const currentEmailCount = leadSnap.data()?.emailCount || 0; // bug fix: was reading workspace.emailCount, which doesn't exist — always reset to 1 instead of incrementing
+
+      const followUpDate = new Date();
+      followUpDate.setDate(followUpDate.getDate() + 3);
+
+      await leadRef.update({
+        status: 'Contacted',
+        lastContacted: new Date().toISOString(),
+        followUpDate: followUpDate.toISOString(),
+        messageId: sendData.id,
+        threadId: sendData.threadId,
+        emailCount: currentEmailCount + 1,
+        updatedAt: new Date().toISOString()
+      });
     }
 
     return response.status(200).json({
