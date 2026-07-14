@@ -106,7 +106,15 @@ export default async function handler(request, response) {
     });
 
     if (incomingMessages.length === 0) {
-      return response.status(200).json({ hasReply: false, reply: null });
+      return response.status(200).json({
+        hasReply: false,
+        reply: null,
+        debugInfo: {
+          messageCount: messages.length,
+          checkedAgainstEmail: ourEmail,
+          allSenders: messages.map(m => getHeader(m, 'From'))
+        }
+      });
     }
 
     // Messages come back in chronological order — take the last incoming one
