@@ -98,11 +98,35 @@ export default async function handler(request, response) {
     const threadData = await threadRes.json();
     const messages = threadData.messages || [];
 
-    // Step 4: find the most recent message NOT sent by us
+    // Step 4: find the most recent message NOT sent by us.
+    //
+    // BUG FIX (found via on-screen debugInfo, July 2026): previously
+    // used `!fromHeader.includes(ourEmail)` with ourEmail possibly
+    // being an empty string (when workspace.gmailEmail wasn't
+    // populated) — String.includes('') is always true, so EVERY
+    // message, including real replies, got misclassified as "sent
+    // by us" and silently filtered out. Two fixes applied:
+    //   1. Defensive guard: if ourEmail is empty, fall back to
+    //      Gmail's own SENT label instead of string comparison —
+    //      this is more reliable anyway, since it's Gmail's own
+    //      classification rather than us re-deriving it from a
+    //      possibly-stale stored email.
+    //   2. Even when ourEmail IS populated, prefer the label check
+    //      as primary signal, with the string comparison only as
+    //      fallback for edge cases.
     const ourEmail = (workspace.gmailEmail || '').toLowerCase();
     const incomingMessages = messages.filter(msg => {
-      const fromHeader = getHeader(msg, 'From') || '';
-      return !fromHeader.toLowerCase().includes(ourEmail);
+      const labels = msg.labelIds || [];
+      if (labels.includes('SENT')) return false; // Gmail's own classification — most reliable signal
+      if (labels.includes('INBOX') || labels.includes('UNREAD')) return true; // clearly incoming
+
+      // Fallback for messages with ambiguous/missing labels: compare
+      // From header, but only if we actually have ourEmail to compare
+      // against (an empty ourEmail here means "unknown," not "match
+      // everything" — this is the specific bug that was fixed).
+      if (!ourEmail) return true; // can't determine sender — assume incoming rather than silently dropping it
+      const fromHeader = (getHeader(msg, 'From') || '').toLowerCase();
+      return !fromHeader.includes(ourEmail);
     });
 
     if (incomingMessages.length === 0) {

@@ -94,6 +94,17 @@ export default async function handler(request, response) {
     });
     const userInfo = await userInfoRes.json();
 
+    if (!userInfoRes.ok || !userInfo.email) {
+      // Bug history: this previously failed silently and stored
+      // gmailEmail: null, which broke check-reply.js's sender
+      // comparison in a way that was hard to diagnose (see that
+      // file's fix notes). Logging loudly now so this is caught
+      // immediately in Vercel logs if it ever happens again — most
+      // likely cause is the OAuth consent not including the email
+      // scope (see gmailService.js's GMAIL_SCOPES).
+      console.error('userinfo fetch failed or returned no email:', userInfo);
+    }
+
     // Step 3: store the refresh token on the workspace doc
     const db = getAdminDb();
     await db.collection('workspaces').doc(workspaceId).update({
