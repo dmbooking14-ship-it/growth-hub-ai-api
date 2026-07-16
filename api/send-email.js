@@ -140,6 +140,12 @@ export default async function handler(request, response) {
         // real to "follow up on."
         lastEmailSubject: subject,
         lastEmailBody: body,
+        // Which connected Gmail account sent this — matters if the
+        // workspace ever switches accounts (Settings > Disconnect >
+        // Connect a different one). A reply arrives in whichever
+        // account sent the original message, so knowing this per
+        // lead avoids confusion about which inbox to check.
+        sentFromEmail: workspace.gmailEmail || null,
         updatedAt: new Date().toISOString()
       });
     }
