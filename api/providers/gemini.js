@@ -54,7 +54,7 @@ export async function callGemini(prompt) {
         },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 2500 }
+          generationConfig: { temperature: 0.7, maxOutputTokens: 1500 }
         })
       });
 
@@ -71,40 +71,14 @@ export async function callGemini(prompt) {
       }
 
       const data = await response.json();
-      const candidate = data?.candidates?.[0];
-      const text = candidate?.content?.parts?.[0]?.text;
-      const finishReason = candidate?.finishReason;
-
-      // DIAGNOSTIC LOGGING (temporary — investigating truncated
-      // outputs reported July 2026). Check Vercel's function logs
-      // after a test generation for this exact line. finishReason
-      // tells us definitively why generation stopped:
-      //   STOP        = completed normally (truncation is NOT this)
-      //   MAX_TOKENS   = hit maxOutputTokens (raise the limit)
-      //   SAFETY       = content filter triggered
-      //   RECITATION   = flagged as reproducing source text (likely
-      //                  culprit — we feed a real reference email
-      //                  into the prompt, which may trip this)
-      //   OTHER        = unspecified
-      console.log('[Gemini diagnostic] finishReason:', finishReason, '| text length:', text?.length, '| key index:', i + 1);
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
 
       if (!text) {
-        errors.push(`Gemini key ${i + 1}: empty response (finishReason: ${finishReason || 'unknown'})`);
+        errors.push(`Gemini key ${i + 1}: empty response`);
         continue;
       }
 
-      if (finishReason && finishReason !== 'STOP') {
-        // Generation was cut short for a reason other than natural
-        // completion. Still return the (partial) text rather than
-        // failing outright — a partial email is more useful than
-        // none, and the finishReason is now visible in logs — but
-        // flag it clearly so the caller/UI could eventually surface
-        // "this response may be incomplete" if desired.
-        errors.push(`Gemini key ${i + 1}: finished early (${finishReason})`);
-        console.warn(`[Gemini diagnostic] Non-STOP finishReason: ${finishReason}. Returning partial text anyway.`);
-      }
-
-      return { text, provider: 'gemini', model: MODEL, finishReason: finishReason || 'STOP' };
+      return { text, provider: 'gemini', model: MODEL };
 
     } catch (err) {
       // Network-level failure (timeout, DNS, etc.) — treat as transient, try next key.
