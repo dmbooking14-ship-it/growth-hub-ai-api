@@ -129,6 +129,7 @@ export default async function handler(request, response) {
 
       await leadRef.update({
         status: 'Contacted',
+        nextAction: 'Waiting for Reply',
         lastContacted: new Date().toISOString(),
         followUpDate: followUpDate.toISOString(),
         messageId: sendData.id,
