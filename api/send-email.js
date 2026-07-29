@@ -3,8 +3,19 @@
 //
 // Endpoint: https://growth-hub-ai-api.vercel.app/api/send-email
 //
-// POST body: { workspaceId, leadId, to, subject, body }
+// POST body: { workspaceId, leadId, to, subject, body, threadId?, inReplyTo? }
 // Response:  { success: true, messageId, threadId }
+//
+// threadId/inReplyTo are OPTIONAL and only used for in-app replies
+// (leadDetail.js's Reply button, after Check for Reply finds a
+// message) — when present, Gmail's `threadId` field is included in
+// the send request AND the raw message gets In-Reply-To/References
+// headers set to inReplyTo (the original message's Message-ID
+// header, from check-reply.js's response). Both are required
+// together for Gmail to actually thread the message correctly —
+// threadId alone is not sufficient. Omitting both (the normal
+// first-contact/follow-up case) sends a new, unthreaded message
+// exactly as before — this is fully backward compatible.
 //
 // This is the ONLY endpoint that actually sends an email — it is
 // only ever called after the founder has reviewed and approved the
@@ -57,7 +68,7 @@ export default async function handler(request, response) {
     return response.status(405).json({ error: 'Use POST' });
   }
 
-  const { workspaceId, leadId, to, subject, body } = request.body || {};
+  const { workspaceId, leadId, to, subject, body, threadId, inReplyTo } = request.body || {};
 
   if (!workspaceId || !to || !subject || !body) {
     return response.status(400).json({ error: 'Missing required field(s): workspaceId, to, subject, body' });
@@ -96,16 +107,21 @@ export default async function handler(request, response) {
     }
 
     // Step 3: build the raw RFC 2822 message and base64url-encode it
-    const rawMessage = buildRawEmail({ to, from: workspace.gmailEmail, subject, body });
+    const rawMessage = buildRawEmail({ to, from: workspace.gmailEmail, subject, body, inReplyTo });
 
-    // Step 4: send via Gmail API
+    // Step 4: send via Gmail API — threadId is included ONLY when
+    // replying to an existing thread; Gmail creates a new thread
+    // automatically when it's omitted, exactly as before.
+    const sendPayload = { raw: rawMessage };
+    if (threadId) sendPayload.threadId = threadId;
+
     const sendRes = await fetch(GMAIL_SEND_URL, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${tokenData.access_token}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ raw: rawMessage })
+      body: JSON.stringify(sendPayload)
     });
     const sendData = await sendRes.json();
 
@@ -124,14 +140,14 @@ export default async function handler(request, response) {
       const leadSnap = await leadRef.get();
       const currentEmailCount = leadSnap.data()?.emailCount || 0; // bug fix: was reading workspace.emailCount, which doesn't exist — always reset to 1 instead of incrementing
 
-      const followUpDate = new Date();
-      followUpDate.setDate(followUpDate.getDate() + 3);
-
-      await leadRef.update({
-        status: 'Contacted',
-        nextAction: 'Waiting for Reply',
-        lastContacted: new Date().toISOString(),
-        followUpDate: followUpDate.toISOString(),
+      // A threaded reply (inReplyTo set) means the founder is
+      // responding to a lead who already replied — that's a
+      // different situation from cold outreach or a follow-up, and
+      // should NOT reset status back to "Contacted" or schedule a
+      // fresh 3-day follow-up as if this were a first message. The
+      // lead stays wherever its status already reflects (e.g.
+      // "Replied") and just gets its content/count fields updated.
+      const updates = {
         messageId: sendData.id,
         threadId: sendData.threadId,
         emailCount: currentEmailCount + 1,
@@ -148,7 +164,23 @@ export default async function handler(request, response) {
         // lead avoids confusion about which inbox to check.
         sentFromEmail: workspace.gmailEmail || null,
         updatedAt: new Date().toISOString()
-      });
+      };
+
+      if (!inReplyTo) {
+        // Normal cold-outreach or follow-up send — same behavior as
+        // before this change, unaffected.
+        const followUpDate = new Date();
+        followUpDate.setDate(followUpDate.getDate() + 3);
+        updates.status = 'Contacted';
+        updates.nextAction = 'Waiting for Reply';
+        updates.lastContacted = new Date().toISOString();
+        updates.followUpDate = followUpDate.toISOString();
+      } else {
+        updates.lastContacted = new Date().toISOString();
+        updates.nextAction = 'Waiting for Reply';
+      }
+
+      await leadRef.update(updates);
     }
 
     return response.status(200).json({
@@ -166,12 +198,22 @@ export default async function handler(request, response) {
 /**
  * Builds a minimal RFC 2822 email and base64url-encodes it, as
  * required by Gmail's API `raw` field format.
+ *
+ * When inReplyTo is provided (the original message's Message-ID
+ * header, e.g. "<abc123@mail.gmail.com>"), In-Reply-To and
+ * References headers are added — these, together with the
+ * `threadId` passed separately in the send request, are what make
+ * Gmail (and the recipient's mail client) treat this as a genuine
+ * reply within the existing conversation rather than a new,
+ * disconnected message.
  */
-function buildRawEmail({ to, from, subject, body }) {
+function buildRawEmail({ to, from, subject, body, inReplyTo }) {
   const message = [
     `To: ${to}`,
     from ? `From: ${from}` : '',
     `Subject: ${subject}`,
+    inReplyTo ? `In-Reply-To: ${inReplyTo}` : '',
+    inReplyTo ? `References: ${inReplyTo}` : '',
     'Content-Type: text/plain; charset="UTF-8"',
     '',
     body

@@ -4,7 +4,7 @@
 // Endpoint: https://growth-hub-ai-api.vercel.app/api/check-reply
 //
 // POST body: { workspaceId, threadId }
-// Response:  { hasReply: boolean, reply: { from, body, receivedAt } | null }
+// Response:  { hasReply: boolean, reply: { from, body, receivedAt, messageId } | null }
 //
 // On-demand only (Option A from planning) — checked when the
 // founder taps "Check for Reply" on a lead's detail screen. No
@@ -146,13 +146,21 @@ export default async function handler(request, response) {
     const replyBody = extractPlainTextBody(latestReply);
     const fromHeader = getHeader(latestReply, 'From') || '';
     const dateHeader = getHeader(latestReply, 'Date') || '';
+    // Message-ID (RFC header, not Gmail's internal message id) is
+    // what a real reply needs in its own In-Reply-To/References
+    // headers to land as a genuine threaded reply in Gmail, rather
+    // than a disconnected new message that merely mentions the same
+    // subject. Added to support in-app reply (send-email.js accepts
+    // this as inReplyTo).
+    const messageIdHeader = getHeader(latestReply, 'Message-ID') || null;
 
     return response.status(200).json({
       hasReply: true,
       reply: {
         from: fromHeader,
         body: replyBody,
-        receivedAt: dateHeader ? new Date(dateHeader).toISOString() : new Date().toISOString()
+        receivedAt: dateHeader ? new Date(dateHeader).toISOString() : new Date().toISOString(),
+        messageId: messageIdHeader
       }
     });
 
