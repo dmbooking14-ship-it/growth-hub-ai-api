@@ -3,8 +3,18 @@
 //
 // Endpoint: https://growth-hub-ai-api.vercel.app/api/check-reply
 //
-// POST body: { workspaceId, threadId }
+// POST body: { workspaceId, threadId, accountId? }
 // Response:  { hasReply: boolean, reply: { from, body, receivedAt, messageId } | null }
+//
+// MULTI-ACCOUNT UPDATE: `accountId` is OPTIONAL but should always
+// be passed when known — a thread must be checked using the SAME
+// account that sent the original message (a reply lands in that
+// account's inbox, not necessarily the workspace's default one).
+// Callers have this available: every lead now carries
+// sentFromAccountId (see send-email.js), so replyCheckService.js
+// passes lead.sentFromAccountId straight through. Omitting it falls
+// back to the workspace's default account, for backward
+// compatibility with leads sent before this field existed.
 //
 // On-demand only (Option A from planning) — checked when the
 // founder taps "Check for Reply" on a lead's detail screen. No
@@ -25,6 +35,7 @@
 
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
+import { resolveGmailAccount, getAccessToken } from './_gmailAccounts.js';
 
 function getAdminDb() {
   if (getApps().length === 0) {
@@ -34,7 +45,6 @@ function getAdminDb() {
   return getFirestore();
 }
 
-const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GMAIL_THREAD_URL = (threadId) => `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}?format=full`;
 
 export default async function handler(request, response) {
@@ -49,7 +59,7 @@ export default async function handler(request, response) {
     return response.status(405).json({ error: 'Use POST' });
   }
 
-  const { workspaceId, threadId } = request.body || {};
+  const { workspaceId, threadId, accountId } = request.body || {};
 
   if (!workspaceId || !threadId) {
     return response.status(400).json({ error: 'Missing required field(s): workspaceId, threadId' });
@@ -58,35 +68,31 @@ export default async function handler(request, response) {
   const db = getAdminDb();
 
   try {
-    // Step 1: get the workspace's stored refresh token + connected email
+    // Step 1: resolve which account this thread belongs to
     const workspaceSnap = await db.collection('workspaces').doc(workspaceId).get();
     const workspace = workspaceSnap.data();
 
-    if (!workspace?.gmailRefreshToken) {
+    if (!workspace) {
+      return response.status(404).json({ error: 'Workspace not found.' });
+    }
+
+    const account = resolveGmailAccount(workspace, accountId);
+
+    if (!account || !account.refreshToken) {
       return response.status(400).json({ error: 'Gmail is not connected for this workspace. Connect it in Settings first.' });
     }
 
     // Step 2: exchange refresh token for a fresh access token
-    const tokenRes = await fetch(TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        refresh_token: workspace.gmailRefreshToken,
-        client_id: process.env.GMAIL_CLIENT_ID,
-        client_secret: process.env.GMAIL_CLIENT_SECRET,
-        grant_type: 'refresh_token'
-      })
-    });
-    const tokenData = await tokenRes.json();
-
-    if (!tokenRes.ok || !tokenData.access_token) {
-      console.error('Access token refresh failed:', tokenData);
-      return response.status(401).json({ error: 'Gmail connection expired or was revoked. Please reconnect in Settings.' });
+    let accessToken;
+    try {
+      accessToken = await getAccessToken(account.refreshToken);
+    } catch (err) {
+      return response.status(401).json({ error: err.message, accountId: account.id });
     }
 
     // Step 3: fetch the full thread
     const threadRes = await fetch(GMAIL_THREAD_URL(threadId), {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+      headers: { Authorization: `Bearer ${accessToken}` }
     });
 
     if (!threadRes.ok) {
@@ -114,7 +120,7 @@ export default async function handler(request, response) {
     //   2. Even when ourEmail IS populated, prefer the label check
     //      as primary signal, with the string comparison only as
     //      fallback for edge cases.
-    const ourEmail = (workspace.gmailEmail || '').toLowerCase();
+    const ourEmail = (account.email || '').toLowerCase();
     const incomingMessages = messages.filter(msg => {
       const labels = msg.labelIds || [];
       if (labels.includes('SENT')) return false; // Gmail's own classification — most reliable signal

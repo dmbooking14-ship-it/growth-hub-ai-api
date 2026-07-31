@@ -3,8 +3,27 @@
 //
 // Endpoint: https://growth-hub-ai-api.vercel.app/api/send-email
 //
-// POST body: { workspaceId, leadId, to, subject, body, threadId?, inReplyTo? }
-// Response:  { success: true, messageId, threadId }
+// POST body: { workspaceId, leadId, to, subject, body, threadId?, inReplyTo?, accountId? }
+// Response:  { success: true, messageId, threadId, sentFromEmail, sentFromAccountId }
+//
+// MULTI-ACCOUNT UPDATE: `accountId` is OPTIONAL — omitting it falls
+// back to the workspace's default/only connected account (see
+// _gmailAccounts.js's resolveGmailAccount), so any existing caller
+// that hasn't been updated yet keeps working exactly as before.
+// When provided, that SPECIFIC account's token is used, and its
+// email is what gets recorded as sentFromEmail on the lead — this
+// is how the founder's account choice (single-lead picker, or the
+// bulk auto-router) actually takes effect.
+//
+// DAILY CAP ENFORCEMENT lives here, not just in the frontend's
+// pre-send planning — the frontend decides which account SHOULD
+// send each message in a batch, but this endpoint is the last line
+// of defense against actually exceeding a cap, since it's the one
+// place that can't be raced or skipped by a bug elsewhere. If the
+// resolved account is already at/over its dailyCap, the send is
+// refused with a specific error code the frontend's batch
+// orchestrator watches for, so it can fall through to the next
+// account rather than just failing that lead outright.
 //
 // threadId/inReplyTo are OPTIONAL and only used for in-app replies
 // (leadDetail.js's Reply button, after Check for Reply finds a
@@ -26,9 +45,11 @@
 // content for itself.
 //
 // Flow:
-//   1. Look up the workspace's stored Gmail refresh token
-//   2. Exchange it for a fresh short-lived access token (refresh
-//      tokens can't be used directly to call the Gmail API)
+//   1. Resolve which Gmail account to send from (accountId, or the
+//      workspace's default) and check it against its daily cap
+//   2. Exchange its refresh token for a fresh short-lived access
+//      token (refresh tokens can't be used directly to call the
+//      Gmail API)
 //   3. Build a raw RFC 2822 email message, base64url-encode it
 //      (Gmail's API requires this exact format)
 //   4. Send via Gmail's API
@@ -44,6 +65,7 @@
 
 import { initializeApp, getApps, cert } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
+import { resolveGmailAccount, getAccessToken, countSentInLast24h } from './_gmailAccounts.js';
 
 function getAdminDb() {
   if (getApps().length === 0) {
@@ -53,7 +75,6 @@ function getAdminDb() {
   return getFirestore();
 }
 
-const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GMAIL_SEND_URL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
 
 export default async function handler(request, response) {
@@ -68,7 +89,7 @@ export default async function handler(request, response) {
     return response.status(405).json({ error: 'Use POST' });
   }
 
-  const { workspaceId, leadId, to, subject, body, threadId, inReplyTo } = request.body || {};
+  const { workspaceId, leadId, to, subject, body, threadId, inReplyTo, accountId } = request.body || {};
 
   if (!workspaceId || !to || !subject || !body) {
     return response.status(400).json({ error: 'Missing required field(s): workspaceId, to, subject, body' });
@@ -77,37 +98,53 @@ export default async function handler(request, response) {
   const db = getAdminDb();
 
   try {
-    // Step 1: get the workspace's stored refresh token
+    // Step 1: resolve which account to send from
     const workspaceSnap = await db.collection('workspaces').doc(workspaceId).get();
     const workspace = workspaceSnap.data();
 
-    if (!workspace?.gmailRefreshToken) {
+    if (!workspace) {
+      return response.status(404).json({ error: 'Workspace not found.' });
+    }
+
+    const account = resolveGmailAccount(workspace, accountId);
+
+    if (!account || !account.refreshToken) {
       return response.status(400).json({ error: 'Gmail is not connected for this workspace. Connect it in Settings first.' });
     }
 
-    // Step 2: exchange refresh token for a fresh access token
-    const tokenRes = await fetch(TOKEN_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        refresh_token: workspace.gmailRefreshToken,
-        client_id: process.env.GMAIL_CLIENT_ID,
-        client_secret: process.env.GMAIL_CLIENT_SECRET,
-        grant_type: 'refresh_token'
-      })
-    });
-    const tokenData = await tokenRes.json();
+    // Daily cap check — last line of defense. The frontend's batch
+    // planner should already be routing around a full account, but
+    // this check exists so the cap is enforced even if that
+    // planning logic has a bug, is bypassed, or the batch spans
+    // more than 24h and an account "refills" mid-batch (in which
+    // case this correctly allows sending again, since it's a live
+    // check, not a cached count from when the batch started).
+    const sentToday = await countSentInLast24h(db, workspaceId, account.id, account.email);
+    const cap = account.dailyCap || 50;
+    if (sentToday >= cap) {
+      // Specific error code (not just a message) so the frontend's
+      // bulk orchestrator can reliably detect "this account is
+      // full, try the next one" versus a real failure worth
+      // reporting as failed rather than retried elsewhere.
+      return response.status(429).json({
+        error: `This account (${account.email}) has reached its daily limit of ${cap} emails.`,
+        code: 'DAILY_CAP_REACHED',
+        accountId: account.id,
+        sentToday,
+        dailyCap: cap
+      });
+    }
 
-    if (!tokenRes.ok || !tokenData.access_token) {
-      console.error('Access token refresh failed:', tokenData);
-      // A revoked/expired refresh token is the most likely cause —
-      // surface this clearly so the UI can prompt reconnection
-      // rather than showing a generic failure.
-      return response.status(401).json({ error: 'Gmail connection expired or was revoked. Please reconnect in Settings.' });
+    // Step 2: exchange refresh token for a fresh access token
+    let accessToken;
+    try {
+      accessToken = await getAccessToken(account.refreshToken);
+    } catch (err) {
+      return response.status(401).json({ error: err.message, accountId: account.id });
     }
 
     // Step 3: build the raw RFC 2822 message and base64url-encode it
-    const rawMessage = buildRawEmail({ to, from: workspace.gmailEmail, subject, body, inReplyTo });
+    const rawMessage = buildRawEmail({ to, from: account.email, subject, body, inReplyTo });
 
     // Step 4: send via Gmail API — threadId is included ONLY when
     // replying to an existing thread; Gmail creates a new thread
@@ -118,7 +155,7 @@ export default async function handler(request, response) {
     const sendRes = await fetch(GMAIL_SEND_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${tokenData.access_token}`,
+        Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(sendPayload)
@@ -127,7 +164,7 @@ export default async function handler(request, response) {
 
     if (!sendRes.ok) {
       console.error('Gmail send failed:', sendData);
-      return response.status(502).json({ error: 'Gmail rejected the send request.', detail: sendData });
+      return response.status(502).json({ error: 'Gmail rejected the send request.', detail: sendData, accountId: account.id });
     }
 
     // Step 5: update the lead record, if a leadId was provided.
@@ -157,20 +194,30 @@ export default async function handler(request, response) {
         // real to "follow up on."
         lastEmailSubject: subject,
         lastEmailBody: body,
-        // Which connected Gmail account sent this — matters if the
-        // workspace ever switches accounts (Settings > Disconnect >
-        // Connect a different one). A reply arrives in whichever
+        // Which connected Gmail account sent this — matters now that
+        // a workspace can have several. A reply arrives in whichever
         // account sent the original message, so knowing this per
         // lead avoids confusion about which inbox to check.
-        sentFromEmail: workspace.gmailEmail || null,
+        // sentFromAccountId is the new, stable identifier (survives
+        // an account being renamed/reconnected under the same
+        // email); sentFromEmail is kept alongside it since it's a
+        // human-readable field already shown directly on Lead
+        // Detail with no lookup needed.
+        sentFromEmail: account.email || null,
+        sentFromAccountId: account.id || null,
         updatedAt: new Date().toISOString()
       };
 
       if (!inReplyTo) {
         // Normal cold-outreach or follow-up send — same behavior as
-        // before this change, unaffected.
+        // before this change, unaffected. Cadence now comes from
+        // workspace.followUpCadenceDays (Settings screen), defaulting
+        // to 3 for any workspace created before that field existed.
+        const cadenceDays = typeof workspace.followUpCadenceDays === 'number' && workspace.followUpCadenceDays > 0
+          ? workspace.followUpCadenceDays
+          : 3;
         const followUpDate = new Date();
-        followUpDate.setDate(followUpDate.getDate() + 3);
+        followUpDate.setDate(followUpDate.getDate() + cadenceDays);
         updates.status = 'Contacted';
         updates.nextAction = 'Waiting for Reply';
         updates.lastContacted = new Date().toISOString();
@@ -186,7 +233,9 @@ export default async function handler(request, response) {
     return response.status(200).json({
       success: true,
       messageId: sendData.id,
-      threadId: sendData.threadId
+      threadId: sendData.threadId,
+      sentFromEmail: account.email || null,
+      sentFromAccountId: account.id || null
     });
 
   } catch (err) {
