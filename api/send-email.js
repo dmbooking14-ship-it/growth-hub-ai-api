@@ -89,7 +89,7 @@ export default async function handler(request, response) {
     return response.status(405).json({ error: 'Use POST' });
   }
 
-  const { workspaceId, leadId, to, subject, body, threadId, inReplyTo, accountId } = request.body || {};
+  const { workspaceId, leadId, to, subject, body, threadId, inReplyTo, accountId, verificationStatus } = request.body || {};
 
   if (!workspaceId || !to || !subject || !body) {
     return response.status(400).json({ error: 'Missing required field(s): workspaceId, to, subject, body' });
@@ -104,6 +104,23 @@ export default async function handler(request, response) {
 
     if (!workspace) {
       return response.status(404).json({ error: 'Workspace not found.' });
+    }
+
+    // Deliverability: refuse to send to a suppressed address. An
+    // address lands here automatically after a confirmed hard bounce
+    // (see check-bounces.js) — sending to it again would just bounce
+    // again, hurting sender reputation for no benefit. This check is
+    // deliberately server-side (not just a frontend warning) so it
+    // can't be bypassed by any caller, same reasoning as the daily
+    // cap check below.
+    const suppressedSnap = await db.collection('workspaces').doc(workspaceId)
+      .collection('suppressionList').doc((to || '').toLowerCase()).get();
+    if (suppressedSnap.exists) {
+      return response.status(403).json({
+        error: `${to} is on the suppression list (previously hard-bounced) and cannot be emailed.`,
+        code: 'SUPPRESSED_ADDRESS',
+        reason: suppressedSnap.data()?.reason || 'Hard bounce'
+      });
     }
 
     const account = resolveGmailAccount(workspace, accountId);
@@ -228,6 +245,51 @@ export default async function handler(request, response) {
       }
 
       await leadRef.update(updates);
+    }
+
+    // Deliverability Center: log every send as its own record,
+    // independent of the lead document. This is the foundation
+    // everything else in the Deliverability Center reads from —
+    // bounce rate, sender health, domain grouping, bounce history —
+    // none of that is derivable from the lead record alone (a lead
+    // only ever holds its MOST RECENT send; a log entry per send
+    // preserves full history, including follow-ups to the same
+    // lead, which the lead document overwrites).
+    //
+    // sendStatus starts as 'sent' (Gmail accepted the submission)
+    // and deliveryStatus starts as 'unknown' — Gmail's send API does
+    // NOT report whether a message actually reached the inbox or
+    // bounced; that only becomes known later, if at all, via an
+    // automated bounce-notification email landing back in this same
+    // account's inbox. check-bounces.js scans for those and updates
+    // this record after the fact — this write only ever establishes
+    // the initial 'sent, unknown outcome' state.
+    try {
+      await db.collection('workspaces').doc(workspaceId).collection('email_logs').add({
+        leadId: leadId || null,
+        campaignId: null, // reserved for the future Campaign Manager feature — not built yet, always null until it exists
+        recipientEmail: (to || '').toLowerCase(),
+        accountId: account.id || null,
+        accountEmail: account.email || null,
+        verificationStatus: verificationStatus || 'unverified',
+        sendStatus: 'sent',
+        deliveryStatus: 'unknown',
+        bounceReason: null,
+        gmailMessageId: sendData.id,
+        gmailThreadId: sendData.threadId,
+        opened: false, // no open-tracking pixel exists yet — reserved field, always false until that's built
+        clicked: false, // same — reserved for future link-tracking
+        replied: false, // updated by check-reply.js's bounce/reply-aware pass if one is added later; for now this stays as sent at creation
+        sentAt: new Date().toISOString(),
+        deliveredAt: null,
+        bouncedAt: null
+      });
+    } catch (logErr) {
+      // Never let logging failure break the actual send — the email
+      // already went out successfully by this point. Log and move
+      // on; a missing log entry is a Deliverability Center gap, not
+      // a reason to report the send itself as failed.
+      console.error('Failed to write email_logs entry (send itself succeeded):', logErr);
     }
 
     return response.status(200).json({
